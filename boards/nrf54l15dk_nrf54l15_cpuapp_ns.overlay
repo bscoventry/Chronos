@@ -77,10 +77,10 @@
 &uart20 { status = "disabled"; };
 &uart21 { status = "disabled"; };
 &uart22 { status = "disabled"; };
-&adc { status = "disabled"; };
+&adc { status = "okay"; };
 &timer20 { status = "disabled"; };
-&timer21 { status = "disabled"; };
-&timer22 { status = "disabled"; };
+&timer21 { status = "okay"; };
+&timer22 { status = "okay"; };
 &timer23 { status = "disabled"; };
 &timer24 { status = "disabled"; };
 //&wdt30 { status = "disabled"; };

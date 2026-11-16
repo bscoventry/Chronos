@@ -1,6 +1,9 @@
 #if defined(CONFIG_BT)
 
 #include "ble_session.h"
+#include "power_off.h"
+#include "chronos_hw.h"
+#include "chronos_reed.h"
 #include "BLE.h"
 
 #include <zephyr/bluetooth/bluetooth.h>
@@ -19,12 +22,10 @@
 LOG_MODULE_REGISTER(ble_session, LOG_LEVEL_INF);
 
 /* P1.15 — pull-down; NO reed to VCC on swipe. Each rising edge toggles BLE after lockout. */
-#define REED_GPIO_NODE     DT_NODELABEL(gpio1)
 #define REED_PIN           15
 #define REED_DEBOUNCE_MS   50
 #define REED_LOCKOUT_MS    10000
 
-static const struct device *reed_port;
 static struct gpio_callback reed_gpio_cb;
 static struct k_work_delayable reed_debounce_work;
 static struct k_work_delayable reed_lockout_work;
@@ -43,6 +44,8 @@ static void reed_lockout_handler(struct k_work *work);
 
 static void reed_irq_enable(void)
 {
+	const struct device *reed_port = chronos_reed_gpio_device();
+
 	if (!reed_port || !device_is_ready(reed_port)) {
 		return;
 	}
@@ -52,6 +55,8 @@ static void reed_irq_enable(void)
 
 static void reed_irq_disable(void)
 {
+	const struct device *reed_port = chronos_reed_gpio_device();
+
 	if (!reed_port || !device_is_ready(reed_port)) {
 		return;
 	}
@@ -97,6 +102,8 @@ static void session_stop_internal(void)
 	k_work_cancel_delayable(&session_inactivity_work);
 	reed_clear_lockout();
 
+	chronos_session_hw_suspend();
+
 #if IS_ENABLED(CONFIG_DK_LIBRARY)
 	dk_set_led_off(RUN_STATUS_LED);
 #endif
@@ -121,6 +128,7 @@ static void session_stop_internal(void)
 	nus_initialized = false;
 	session_active = false;
 	LOG_INF("BLE session off");
+	chronos_power_off_try_enter();
 }
 
 static int session_start_internal(void)
@@ -129,6 +137,11 @@ static int session_start_internal(void)
 
 	if (session_active) {
 		return 0;
+	}
+
+	err = chronos_session_hw_init();
+	if (err != 0) {
+		LOG_WRN("Session HW init err %d", err);
 	}
 
 	err = bt_enable(NULL);
@@ -179,6 +192,7 @@ static void reed_lockout_handler(struct k_work *work)
 static void reed_debounce_handler(struct k_work *work)
 {
 	int level;
+	const struct device *reed_port = chronos_reed_gpio_device();
 
 	ARG_UNUSED(work);
 
@@ -227,30 +241,52 @@ static void reed_gpio_isr(const struct device *port, struct gpio_callback *cb,
 	k_work_reschedule(&reed_debounce_work, K_MSEC(REED_DEBOUNCE_MS));
 }
 
-void ble_session_init(void)
+bool ble_session_is_active(void)
+{
+	return session_active;
+}
+
+void ble_session_arm_reed_wake_for_system_off(void)
+{
+	const struct device *reed_port = chronos_reed_gpio_device();
+
+	if (reed_port != NULL && device_is_ready(reed_port)) {
+		(void)gpio_remove_callback(reed_port, &reed_gpio_cb);
+	}
+
+	chronos_reed_arm_system_off_wake();
+}
+
+static int ble_session_open_from_reed_wake(void)
 {
 	int err;
 
-	reed_port = DEVICE_DT_GET(REED_GPIO_NODE);
-	if (!device_is_ready(reed_port)) {
-		LOG_ERR("GPIO1 not ready for reed (P1.15)");
+	if (session_active) {
+		return 0;
+	}
+
+	err = session_start_internal();
+	if (err == 0) {
+		reed_arm_lockout();
+	}
+
+	return err;
+}
+
+void ble_session_init(void)
+{
+	int err;
+	const struct device *reed_port;
+
+	err = chronos_reed_gpio_init();
+	if (err != 0) {
 		return;
 	}
 
-	err = gpio_pin_configure(reed_port, REED_PIN, GPIO_INPUT | GPIO_PULL_DOWN);
-	if (err) {
-		LOG_ERR("Reed pin cfg err %d", err);
+	reed_port = chronos_reed_gpio_device();
+	if (reed_port == NULL) {
 		return;
 	}
-
-	err = gpio_pin_interrupt_configure(reed_port, REED_PIN, GPIO_INT_EDGE_RISING);
-	if (err) {
-		LOG_ERR("Reed IRQ cfg err %d", err);
-		return;
-	}
-
-	gpio_init_callback(&reed_gpio_cb, reed_gpio_isr, BIT(REED_PIN));
-	gpio_add_callback(reed_port, &reed_gpio_cb);
 
 	k_work_init_delayable(&reed_debounce_work, reed_debounce_handler);
 	k_work_init_delayable(&reed_lockout_work, reed_lockout_handler);
@@ -259,6 +295,20 @@ void ble_session_init(void)
 	reed_lockout_active = false;
 
 	ble_advertising_work_init();
+
+	if (chronos_boot_was_reed_wake()) {
+		LOG_INF("Reed GPIO wake: opening BLE session");
+		(void)ble_session_open_from_reed_wake();
+	}
+
+	gpio_init_callback(&reed_gpio_cb, reed_gpio_isr, BIT(REED_PIN));
+	gpio_add_callback(reed_port, &reed_gpio_cb);
+
+	err = gpio_pin_interrupt_configure(reed_port, REED_PIN, GPIO_INT_EDGE_RISING);
+	if (err) {
+		LOG_ERR("Reed IRQ cfg err %d", err);
+		return;
+	}
 
 #if IS_ENABLED(CONFIG_DK_LIBRARY)
 	dk_set_led_off(RUN_STATUS_LED);

@@ -38,8 +38,9 @@
 	status = "okay";
 	ngpios = <17>;
 };
+/* P2 unused on Chronos custom QFN52 — disable port to reduce leakage. */
 &gpio2 {
-	status = "okay";
+	status = "disabled";
 };
 /* MBOX (IPC hardware) must be okay for BLE-over-IPC; fixes __device_dts_ord_25 undeclared. */
 //&mbox {
@@ -78,10 +79,10 @@
 &uart20 { status = "disabled"; };
 &uart21 { status = "disabled"; };
 &uart22 { status = "disabled"; };
-&adc { status = "disabled"; };
+&adc { status = "okay"; };
 &timer20 { status = "okay"; };
-&timer21 { status = "disabled"; };
-&timer22 { status = "disabled"; };
+&timer21 { status = "okay"; };
+&timer22 { status = "okay"; };
 &timer23 { status = "disabled"; };
 &timer24 { status = "disabled"; };
 &wdt30 { status = "disabled"; };
@@ -101,15 +102,16 @@
 /* &lfxo { status = "disabled"; }; */
 / {
 	chosen {
-		zephyr,console = &uart30;
-		nordic,nus-uart = &uart30;
+		/delete-property/ zephyr,console;
+		/delete-property/ nordic,nus-uart;
 	};
 };
 
-/* nRF54L15 DK uses UART30 for NUS; ensure it is enabled. */
+/* NUS UART is uart00 (app.overlay). UART30 was DK default — keep disabled. */
 &uart30 {
-	status = "okay";
+	status = "disabled";
 };
+
 &grtc {
     status = "okay";
 };

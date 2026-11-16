@@ -10,10 +10,15 @@
 #include <stdio.h>
 #include <stdbool.h>
 
+#include "config.h"
 #include "rtc_stim.h"
 #include "timer.h"
 
 #if !defined(CONFIG_SPI)
+
+#include <hal/nrf_gpio.h>
+
+#define STIM_SESSION_PIN  NRF_GPIO_PIN_MAP(STIM_SESSION_GPIO_PORT, STIM_SESSION_GPIO_NUM)
 
 /* 1 MHz tick rate: matches nrfx_timer_us_to_ticks(); lower prescaler activity than 16 MHz. */
 #define PERIOD_TIMER_TICK_HZ  1000000u
@@ -30,15 +35,10 @@ static void period_timer_handler(nrf_timer_event_t event_type, void *p_context)
 		return;
 	}
 
-	nrf_clock_task_trigger(NRF_CLOCK_S, NRF_CLOCK_TASK_HFCLKSTART);
-	while (!nrf_clock_event_check(NRF_CLOCK_S, NRF_CLOCK_EVENT_HFCLKSTARTED)) {
-		/* spin */
-	}
-	nrf_clock_event_clear(NRF_CLOCK_S, NRF_CLOCK_EVENT_HFCLKSTARTED);
-
 #if defined(CONFIG_BT)
 	stim_run_one_burst();
 #else
+	timer_stim_hfclk_check();
 	timer_do_event0();
 	timer_start_one_shot_biphasic();
 #endif
@@ -119,10 +119,13 @@ static uint32_t period_timer_apply_frequency(uint16_t frequency_hz)
 
 void rtc_stim_stop(void)
 {
+	nrf_gpio_pin_set(STIM_SESSION_PIN);
 	if (!period_timer_inited) {
 		return;
 	}
 	nrfx_timer_disable(&period_timer);
+	timer_stim_switches_park();
+	timer_stim_hfclk_release();
 }
 
 bool rtc_stim_is_running(void)
@@ -170,10 +173,30 @@ void rtc_stim_init(uint16_t frequency_hz)
 	       (unsigned long)period_us,
 	       (unsigned long)period_ticks);
 
+	/*
+	 * Take HFXO before the first period fires. Called from thread context (BLE
+	 * command or boot), which is where the 1650 us crystal startup belongs
+	 * rather than in the period ISR ahead of phase 1.
+	 */
+	int hf_err = timer_stim_hfclk_acquire();
+
+	if (hf_err != 0) {
+		printf("RTC_STIM: HFXO acquire failed err=%d (SPI/DAC timing on HFINT)\n",
+		       hf_err);
+	}
+
+	/*
+	 * Arm with every switch open, so the electrodes stay isolated until the first period
+	 * fires. Re-parking here rather than trusting boot state makes a restart after
+	 * rtc_stim_stop() identical to a cold start.
+	 */
+	timer_stim_switches_park();
+
 	nrfx_timer_disable(&period_timer);
 	nrfx_timer_clear(&period_timer);
 	period_configure_compare();
 	nrfx_timer_enable(&period_timer);
+	nrf_gpio_pin_clear(STIM_SESSION_PIN);
 	printf("RTC_STIM: TIMER20 enabled\n");
 }
 

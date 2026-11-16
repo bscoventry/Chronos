@@ -1,6 +1,8 @@
 #ifndef BLE_H
 #define BLE_H
 
+#include <stddef.h>
+#include <stdint.h>
 #include <zephyr/sys/util.h>
 #include <zephyr/device.h>
 #include <zephyr/kernel.h>
@@ -103,6 +105,13 @@ void connected(struct bt_conn *conn, uint8_t err);
 void disconnected(struct bt_conn *conn, uint8_t reason);
 void recycled_cb(void);
 void bt_receive_cb(struct bt_conn *conn, const uint8_t *const data, uint16_t len);
+#if defined(CONFIG_BT)
+/* Little-endian uint16 sequence followed by the int16 samples; sized for 120 samples. */
+#define BLE_SAMPLE_PKT_MAX_LEN 242
+int ble_send_samples(uint16_t seq, const int16_t *samples, size_t count);
+int ble_send_event(const char *msg);
+int ble_send_raw(const uint8_t *data, size_t len);
+#endif
 
 #ifdef CONFIG_BT_NUS_SECURITY_ENABLED
 void security_changed(struct bt_conn *conn, bt_security_t level,

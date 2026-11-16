@@ -12,7 +12,7 @@ class TestD2B(unittest.TestCase):
     def setUp(self):
         """Set up test constants"""
         self.V_REF = D2B.V_REF
-        self.R_SENSE = D2B.R_SENSE
+        self.TRANSCONDUCTANCE_A_PER_V = D2B.TRANSCONDUCTANCE_A_PER_V
         self.MAX_CURRENT = D2B.MAX_CURRENT
         
     def test_zero_current(self):
@@ -45,10 +45,10 @@ class TestD2B(unittest.TestCase):
         """Test +1 LSB value (+V_REF * 1/32768)"""
         # Calculate current for 1 LSB above zero
         # V_DAC = V_REF * (1/32768)
-        # I = 10 * V_DAC / R_SENSE (in A)
+        # I = TRANSCONDUCTANCE_A_PER_V * V_DAC (in A)
         # I_uA = I * 1000000
         v_dac_1lsb = self.V_REF * (1.0/32768.0)
-        current_1lsb = (10 * v_dac_1lsb / self.R_SENSE) * 1000000  # in μA
+        current_1lsb = (self.TRANSCONDUCTANCE_A_PER_V * v_dac_1lsb) * 1000000  # in μA
         
         result = D2B.decimal_to_binary(current_1lsb)
         self.assertEqual(result, 0x8001, 
@@ -58,7 +58,7 @@ class TestD2B(unittest.TestCase):
         """Test -1 LSB value (-V_REF * 1/32768)"""
         # Calculate current for 1 LSB below zero
         v_dac_neg1lsb = -self.V_REF * (1.0/32768.0)
-        current_neg1lsb = (10 * v_dac_neg1lsb / self.R_SENSE) * 1000000  # in μA
+        current_neg1lsb = (self.TRANSCONDUCTANCE_A_PER_V * v_dac_neg1lsb) * 1000000  # in μA
         
         result = D2B.decimal_to_binary(current_neg1lsb)
         self.assertEqual(result, 0x7FFF, 

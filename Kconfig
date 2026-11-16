@@ -15,6 +15,34 @@ config CHRONOS_ZMEAS_SWITCH_ACTIVE_HIGH
 	default y
 	depends on CHRONOS_ZMEAS
 
+config CHRONOS_SYSTEM_OFF
+	bool "System OFF sleep with P1.15 reed GPIO wake"
+	default y
+	depends on BT
+	select POWEROFF
+	select HWINFO
+	select PM_DEVICE
+	help
+	  After boot or when the BLE session ends, enter System OFF if
+	  stimulation is not running. A reed swipe (P1.15 high) wakes the
+	  SoC and opens a new BLE session.
+
+config CHRONOS_DEFER_SESSION_HW_INIT
+	bool "Defer UART and ZMEAS init until BLE session opens"
+	default y
+	depends on BT
+	help
+	  Skips NUS UART and AD5933 boot probe on cold boot before System OFF.
+	  Peripherals initialize when the BLE session starts (reed swipe).
+
+config CHRONOS_MINIMAL_BOOT
+	bool "Minimal GPIO/reed init before System OFF on cold boot"
+	default y
+	depends on BT && CHRONOS_SYSTEM_OFF
+	help
+	  On power-on (not reed GPIO wake), enter System OFF before SPI, timer,
+	  and BLE session setup. Reduces time and current before deep sleep.
+
 config CHRONOS_STIM_NVM
 	bool "Persist stimulation settings in NVM (Settings/NVS + boot resume)"
 	default y

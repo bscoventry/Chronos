@@ -11,7 +11,7 @@
 #define DEFAULT_STIM_PERIOD 4000000
 // This is the time between SPI transac on DAC1 and switching 1.03 off
 #define DEFAULT_PULSE_WIDTH 1000000  // x1: Time after main event
-/* Interphase gap (P1.02); single source in config.h */
+/* Interphase gap; single source in config.h */
 #define SWITCH_PERIOD  CONFIG_INTER_PHASE_GAP_US
 
 /* Stim timer IRQ: above LOWEST to reduce GPIO/DAC edge jitter under BLE. */
@@ -22,8 +22,15 @@
 
 /* Analog switch GPIO (port 1); QFN52 exposes P1.00–P1.16 */
 #define SWITCH_PIN_FIRST   16  /* P1.16 — ganged with P1.03 for both stimulus phases */
-#define SWITCH_PIN_INTER   2   /* P1.02 — interphase only */
+#define SWITCH_PIN_INTER   2   /* P1.02 — shunt tying cathode to anode */
 #define SWITCH_PIN_SECOND  3   /* P1.03 — ganged with P1.16 for both stimulus phases */
+
+/* All three switch pins live on P1, so state changes go through one port block. */
+#if defined(NRF_P1)
+#define STIM_GPIO_PORT  NRF_P1
+#else
+#define STIM_GPIO_PORT  NRF_GPIO1
+#endif
 
 typedef struct {
     uint32_t event1_max;
@@ -55,6 +62,22 @@ void stim_run_one_burst(void);
 void timer_do_event0(void);
 /** Start one biphasic period: clear TIMER00, set CC1/2/3, enable. Disables after COMPARE3. */
 void timer_start_one_shot_biphasic(void);
+/**
+ * Reference HFXO for a stimulation session. Blocks on crystal startup, so thread
+ * context only; pair with timer_stim_hfclk_release().
+ */
+int timer_stim_hfclk_acquire(void);
+/** Drop the session HFXO reference (stim stopped or powering down). ISR safe. */
+void timer_stim_hfclk_release(void);
+/** Per-burst non-blocking HFXO readiness check; records failures, never waits. */
+void timer_stim_hfclk_check(void);
+/**
+ * Open every analog switch: electrodes floating, current source isolated. This is the
+ * power-on state and the stopped state. Call when stimulation stops, and when arming so
+ * the first burst starts from a known state. Note this is not the inter-pulse state, which
+ * shorts the electrodes through the shunt.
+ */
+void timer_stim_switches_park(void);
 #if !defined(CONFIG_BT)
 /** Initialize TIMER00 for one-shot biphasic bursts (no continuous scheduling). */
 void timer_burst_init(void);

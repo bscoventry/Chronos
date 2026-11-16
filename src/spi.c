@@ -48,6 +48,11 @@ static void spim_ensure_idle(void)
 	spim_xfer_done = false;
 }
 
+void spi_prepare_for_power_off(void)
+{
+	spim_ensure_idle();
+}
+
 static void spim_prepare_next_xfer(void)
 {
 	spim_ensure_idle();
@@ -74,15 +79,6 @@ static void spim_wait_xfer_done(void)
 		spi_xfer_fail_count++;
 		spim_log_xfer_error("SPI xfer timeout/abort", -1);
 	}
-}
-
-static void dac_ensure_hfclk(void)
-{
-	nrf_clock_task_trigger(NRF_CLOCK_S, NRF_CLOCK_TASK_HFCLKSTART);
-	while (!nrf_clock_event_check(NRF_CLOCK_S, NRF_CLOCK_EVENT_HFCLKSTARTED)) {
-		/* spin */
-	}
-	nrf_clock_event_clear(NRF_CLOCK_S, NRF_CLOCK_EVENT_HFCLKSTARTED);
 }
 
 static void spim_handler(nrfx_spim_event_t const *p_event, void *p_context)
@@ -130,6 +126,25 @@ void update_dac2_amplitude(uint16_t amplitude)
 	       opposite_amplitude, amplitude);
 }
 
+void stim_set_amplitude_code_quiet(uint16_t amplitude)
+{
+	uint16_t opposite_amplitude;
+
+	if (amplitude == 0x0000U) {
+		opposite_amplitude = 0x8000U;
+	} else {
+		opposite_amplitude = (uint16_t)(0x10000UL - amplitude);
+	}
+
+	unsigned int key = irq_lock();
+
+	dac1_buf_tx[0] = (amplitude >> 8) & 0xFF;
+	dac1_buf_tx[1] = amplitude & 0xFF;
+	dac2_buf_tx[0] = (opposite_amplitude >> 8) & 0xFF;
+	dac2_buf_tx[1] = opposite_amplitude & 0xFF;
+	irq_unlock(key);
+}
+
 void cs_select(uint32_t pin_number)
 {
 	nrf_gpio_pin_clear(pin_number);
@@ -144,7 +159,11 @@ void spi_write_dac1(uint8_t *tx_data, uint8_t *rx_data)
 {
 	ARG_UNUSED(rx_data);
 
-	dac_ensure_hfclk();
+	/*
+	 * No HFXO start here. This runs once per phase inside the burst, and starting
+	 * the crystal per transfer stalled the pulse; the session reference taken in
+	 * rtc_stim_init() keeps it running for the whole train.
+	 */
 	spim_prepare_next_xfer();
 
 	cs_select(DAC1_CS_PIN);
@@ -166,9 +185,7 @@ void spi_write_dac1(uint8_t *tx_data, uint8_t *rx_data)
 
 	spim_wait_xfer_done();
 
-	for (volatile uint32_t i = 0; i < SPI_CS_HOLD_DELAY_LOOPS; i++) {
-		(void)i;
-	}
+	k_busy_wait(SPI_CS_HOLD_US);
 	cs_deselect(DAC1_CS_PIN);
 
 #if (SPI_VERBOSE == 1)
@@ -214,6 +231,16 @@ void spi_init(void)
 	nrf_gpio_pin_control_select(MOSI_PIN, NRF_GPIO_PIN_SEL_GPIO);
 #endif
 
+#if (SPI_HIGH_DRIVE == 1)
+	/* nrfx's pin_init() only picks H0H1 at 32 MHz, so override the drive it applied. */
+	if (spi_ok) {
+		static const nrf_gpio_pin_drive_t drive = NRF_GPIO_PIN_H0H1;
+
+		nrf_gpio_reconfigure(SCK_PIN, NULL, NULL, NULL, &drive, NULL);
+		nrf_gpio_reconfigure(MOSI_PIN, NULL, NULL, NULL, &drive, NULL);
+	}
+#endif
+
 	{
 		NRF_SPIM_Type *sp = spim_inst.p_reg;
 
@@ -221,6 +248,14 @@ void spi_init(void)
 		       (unsigned long)sp->ENABLE,
 		       (unsigned long)sp->PSEL.SCK,
 		       (unsigned long)sp->PSEL.MOSI);
+#if NRF_SPIM_HAS_PRESCALER
+		/* Anomaly 8 needs prescaler > 2 to bite; 2 means the DAC words are safe. */
+		printf("  PRESCALER=%lu (base=%lu Hz -> %lu Hz)\n",
+		       (unsigned long)nrf_spim_prescaler_get(sp),
+		       (unsigned long)NRF_SPIM_BASE_FREQUENCY_GET(sp),
+		       (unsigned long)(NRF_SPIM_BASE_FREQUENCY_GET(sp) /
+				       nrf_spim_prescaler_get(sp)));
+#endif
 		uint32_t pins[] = { SCK_PIN, MOSI_PIN, DAC_CS_PIN };
 		const char *names[] = { "P1.11 SCK", "P1.10 MOSI", "P1.09 CS" };
 

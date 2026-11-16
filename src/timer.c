@@ -9,7 +9,11 @@
 #include <stdlib.h>
 #include "timer.h"
 #include "spi.h"
+#include "chronos_hfclk.h"
 #include "config.h"
+#if defined(CONFIG_BT)
+#include "closed_loop.h"
+#endif
 
 #if defined(CONFIG_BT) && !defined(CONFIG_SPI)
 #include "rtc_stim.h"
@@ -74,6 +78,12 @@ bool timer_stimulation_is_enabled(void)
 
 void timer_do_event0(void) {}
 void timer_start_one_shot_biphasic(void) {}
+void timer_stim_hfclk_release(void) {}
+void timer_stim_hfclk_check(void) {}
+int timer_stim_hfclk_acquire(void)
+{
+	return 0;
+}
 
 #else /* !CONFIG_SPI: full nrfx timer implementation */
 
@@ -99,28 +109,78 @@ static void p1_mcu_select_app_sync(void)
 }
 #endif
 
-static const uint8_t dac_neutral_tx[DAC_TX_LEN] = { 0x80, 0x00 };
+static const uint8_t dac_zero_tx[DAC_TX_LEN] = {
+	(uint8_t)(STIM_DAC_ZERO_CODE >> 8),
+	(uint8_t)(STIM_DAC_ZERO_CODE & 0xFFU),
+};
 
-/* Howland bipolar: P1.16 + P1.03 ganged for both phases; polarity from DAC only. */
-static void switches_pulse_on(void)
+/*
+ * Stimulus path on P1: FIRST (P1.16) and SECOND (P1.03) are series switches that connect
+ * the Howland output to the electrodes, and INTER (P1.02) is a shunt tying cathode to
+ * anode. Polarity comes from the DAC alone, so both phases use the same series state.
+ *
+ * Series and shunt are complementary in every steady state, so the current source only
+ * reaches the electrodes during the two active phases:
+ *
+ *     state                series  shunt
+ *     init / stopped         0       0
+ *     armed, pre-trigger     0       0
+ *     phase 1                1       0
+ *     interphase             0       1
+ *     phase 2                1       0
+ *     post-burst             0       1
+ *
+ * Transitions are make-before-break, which is why the masks are written separately rather
+ * than as one store. Series is open for the interphase gap and the whole inter-pulse
+ * interval, and an unloaded current pump has nowhere to send its current, so it slews to a
+ * rail. Closing series while the shunt is still closed gives that railed output a short to
+ * recover into instead of the electrodes; only after the DAC is commanded and allowed to
+ * settle does the shunt open and hand over. The reverse order delivers the recovery
+ * transient to the patient.
+ *
+ * OUTSET/OUTCLR are write-1-to-act and leave every other pin untouched, so ordering the
+ * two writes controls the overlap without a read-modify-write on OUT.
+ */
+#define STIM_SERIES_MASK  (BIT(SWITCH_PIN_FIRST) | BIT(SWITCH_PIN_SECOND))
+#define STIM_SHUNT_MASK   BIT(SWITCH_PIN_INTER)
+
+/*
+ * Make: both switches closed. The source is loaded by the shunt and the electrodes are
+ * shorted, so this is where the amplifier recovers from rail and settles to the phase
+ * amplitude. Setting the shunt explicitly rather than assuming the post-burst state left it
+ * closed makes the first burst after arming behave like every later one.
+ */
+static void switches_phase_make(void)
 {
-	nrf_gpio_pin_clear(NRF_GPIO_PIN_MAP(1, SWITCH_PIN_INTER));
-	nrf_gpio_pin_set(NRF_GPIO_PIN_MAP(1, SWITCH_PIN_FIRST));
-	nrf_gpio_pin_set(NRF_GPIO_PIN_MAP(1, SWITCH_PIN_SECOND));
+	nrf_gpio_port_out_set(STIM_GPIO_PORT, STIM_SERIES_MASK | STIM_SHUNT_MASK);
 }
 
-static void switches_interphase(void)
+/* Break: open the shunt, handing already-settled current to the electrodes. */
+static void switches_phase_conduct(void)
 {
-	nrf_gpio_pin_clear(NRF_GPIO_PIN_MAP(1, SWITCH_PIN_FIRST));
-	nrf_gpio_pin_set(NRF_GPIO_PIN_MAP(1, SWITCH_PIN_INTER));
-	nrf_gpio_pin_clear(NRF_GPIO_PIN_MAP(1, SWITCH_PIN_SECOND));
+	nrf_gpio_port_out_clear(STIM_GPIO_PORT, STIM_SHUNT_MASK);
 }
 
-static void switches_all_off(void)
+/*
+ * End a phase: close the shunt first, which diverts conduction away from the electrodes
+ * through a much lower impedance and so defines the falling edge, then open series to
+ * isolate the source. Used for both the interphase gap and the post-burst interval.
+ */
+static void switches_shunt_only(void)
 {
-	nrf_gpio_pin_clear(NRF_GPIO_PIN_MAP(1, SWITCH_PIN_FIRST));
-	nrf_gpio_pin_clear(NRF_GPIO_PIN_MAP(1, SWITCH_PIN_INTER));
-	nrf_gpio_pin_clear(NRF_GPIO_PIN_MAP(1, SWITCH_PIN_SECOND));
+	nrf_gpio_port_out_set(STIM_GPIO_PORT, STIM_SHUNT_MASK);
+	nrf_gpio_port_out_clear(STIM_GPIO_PORT, STIM_SERIES_MASK);
+}
+
+/*
+ * Every switch open: electrodes floating, source isolated. This is the power-on state and
+ * the state stimulation stops in, and it is deliberately not the inter-pulse state, which
+ * shorts the electrodes through the shunt. Arming re-parks here so the first burst starts
+ * from a known state rather than from wherever the previous session ended.
+ */
+void timer_stim_switches_park(void)
+{
+	nrf_gpio_port_out_clear(STIM_GPIO_PORT, STIM_SERIES_MASK | STIM_SHUNT_MASK);
 }
 
 static void dac_write_buf(const uint8_t *tx)
@@ -130,46 +190,65 @@ static void dac_write_buf(const uint8_t *tx)
 	}
 }
 
-/* Close pulse path at neutral, allow network to settle, then update DAC (path stays on). */
-static void switch_settle_then_dac(const uint8_t *tx)
+/*
+ * Both phases start the same way, from a state where series is open and the source is
+ * sitting at a rail. Series closes into the still-closed shunt, the DAC is commanded while
+ * the shunt absorbs the output, and only after the settle does the shunt open and pass a
+ * settled current to the electrodes.
+ *
+ * The settle is a pre-roll on both phases: conduction starts CONFIG_DAC_SETTLE_US plus one
+ * SPI transfer after the compare event. Phase 1 and phase 2 now pay it equally so it no
+ * longer skews them against each other, but it does shorten both relative to the programmed
+ * pulse width, and compensating that belongs in the compare values rather than here.
+ *
+ * CONFIG_DAC_SETTLE_US now has to cover the amplifier recovering from a rail rather than
+ * just a DAC step, and at phase 2 the whole pre-roll has to fit inside
+ * CONFIG_INTER_PHASE_GAP_US. Both want scoping on the bench.
+ */
+static void stim_phase_begin(const uint8_t *tx)
 {
-	switches_pulse_on();
+	switches_phase_make();
+	dac_write_buf(tx);
 	if (CONFIG_DAC_SETTLE_US > 0U) {
 		k_busy_wait(CONFIG_DAC_SETTLE_US);
 	}
-	dac_write_buf(tx);
+	switches_phase_conduct();
 }
 
 static void stim_phase1_begin(void)
 {
-	switch_settle_then_dac(dac2_buf_tx);
+	stim_phase_begin(dac2_buf_tx);
 }
 
+/*
+ * Interphase gap: end conduction, short the electrodes, isolate the source. The DAC is
+ * zeroed afterwards so the slow SPI transfer stays off the falling edge, which the shunt
+ * defines.
+ *
+ * Shorting here recovers phase 1's charge passively through the electrode instead of
+ * leaving it for phase 2 to reverse, so the pair is no longer actively charge balanced. Net
+ * DC is still held at zero by the series blocking capacitor and the long post-burst short.
+ * What changes is that each phase now sits on a passive recovery transient whose initial
+ * current is the stored voltage over the loop resistance, which can exceed the programmed
+ * amplitude.
+ */
 static void stim_interphase_begin(void)
 {
-	/* Open stimulus path before neutral DAC (avoids discharge through closed switch). */
-	switches_interphase();
-	dac_write_buf(dac_neutral_tx);
+	switches_shunt_only();
+	dac_write_buf(dac_zero_tx);
 }
 
-static void stim_interphase_end(void)
-{
-	switches_all_off();
-}
-
+/* Phase 2 reverses polarity through the DAC; the switch sequence is identical to phase 1. */
 static void stim_phase2_begin(void)
 {
-	switch_settle_then_dac(dac1_buf_tx);
+	stim_phase_begin(dac1_buf_tx);
 }
 
+/* End of burst: same transition as the interphase gap, held until the next period. */
 static void stim_idle_begin(void)
 {
-	/* Open path before neutral DAC (avoids 0 A step through closed electrode path). */
-	switches_all_off();
-	if (CONFIG_DAC_SETTLE_US > 0U) {
-		k_busy_wait(CONFIG_DAC_SETTLE_US);
-	}
-	dac_write_buf(dac_neutral_tx);
+	switches_shunt_only();
+	dac_write_buf(dac_zero_tx);
 }
 
 static uint32_t timer_freq_hz = 0;  
@@ -246,17 +325,27 @@ static void burst_catchup_after_delay(void)
 
 #if defined(CONFIG_BT)
 static atomic_t stim_stop_pending;
-
-/* BLE stack may allow HFCLK to gate off between events; SPIM + TIMER00 need it during stim. */
-static void stim_ensure_hfclk(void)
-{
-	nrf_clock_task_trigger(NRF_CLOCK_S, NRF_CLOCK_TASK_HFCLKSTART);
-	while (!nrf_clock_event_check(NRF_CLOCK_S, NRF_CLOCK_EVENT_HFCLKSTARTED)) {
-		/* spin */
-	}
-	nrf_clock_event_clear(NRF_CLOCK_S, NRF_CLOCK_EVENT_HFCLKSTARTED);
-}
 #endif
+
+/*
+ * HFXO is held for the whole session, not per burst: at 130 Hz the 1650 us crystal
+ * startup was a fifth of the 7.7 ms period, and it was paid inside the period ISR
+ * ahead of phase 1.
+ */
+int timer_stim_hfclk_acquire(void)
+{
+	return chronos_hfclk_acquire();
+}
+
+void timer_stim_hfclk_release(void)
+{
+	chronos_hfclk_release();
+}
+
+void timer_stim_hfclk_check(void)
+{
+	(void)chronos_hfclk_check_ready();
+}
 
 void get_error_data(error_data *data) {
     data->event1_max = atomic_get(&event1_error_max);
@@ -405,7 +494,6 @@ void stim_timer_request_stop_after_burst(void)
 void timer_stimulation_enable_from_boot(void)
 {
 	atomic_set(&stim_stop_pending, 0);
-	stim_ensure_hfclk();
 	rtc_stim_start_lfclk();
 	nrfx_timer_disable(&timer_inst);
 	nrfx_timer_clear(&timer_inst);
@@ -433,13 +521,15 @@ void stim_run_one_burst(void)
 #if defined(CONFIG_SOC_NRF5340_CPUAPP)
 	p1_mcu_select_app_sync();
 #endif
-	stim_ensure_hfclk();
+	/* Record only: waiting for the crystal here would delay every phase. */
+	timer_stim_hfclk_check();
+
+	closed_loop_on_stim_pulse();
 
 	stim_phase1_begin();
 	k_busy_wait(current_pulse_width_us);
 	stim_interphase_begin();
 	k_busy_wait(SWITCH_PERIOD);
-	stim_interphase_end();
 	stim_phase2_begin();
 	k_busy_wait(current_pulse_width_us);
 	stim_idle_begin();
@@ -497,13 +587,20 @@ void timer_start_one_shot_biphasic(void)
     nrfx_timer_enable(&timer_inst);
 }
 
-nrfx_timer_t measurement_timer_init() {
-    nrfx_timer_config_t config = NRFX_TIMER_DEFAULT_CONFIG(NRF_TIMER_BASE_FREQUENCY_GET(measurement_timer.p_reg));
-    config.bit_width = NRF_TIMER_BIT_WIDTH_32;
-    nrfx_err_t err = nrfx_timer_init(&measurement_timer, &config, NULL); // No handler needed
-    (void)err;
-    nrfx_timer_enable(&measurement_timer);
-    return measurement_timer;
+nrfx_timer_t measurement_timer_init(void)
+{
+#if MEASURE_TIMER == 0
+	return measurement_timer;
+#else
+	nrfx_timer_config_t config =
+		NRFX_TIMER_DEFAULT_CONFIG(NRF_TIMER_BASE_FREQUENCY_GET(measurement_timer.p_reg));
+
+	config.bit_width = NRF_TIMER_BIT_WIDTH_32;
+	nrfx_err_t err = nrfx_timer_init(&measurement_timer, &config, NULL);
+	(void)err;
+	nrfx_timer_enable(&measurement_timer);
+	return measurement_timer;
+#endif
 }
 
 static void timer_handler(nrf_timer_event_t event_type, void * p_context)
@@ -522,9 +619,6 @@ static void timer_handler(nrf_timer_event_t event_type, void * p_context)
     
     switch(event_type) {
         case NRF_TIMER_EVENT_COMPARE0:
-#if defined(CONFIG_BT)
-            stim_ensure_hfclk();
-#endif
             if(MEASURE_TIMER == 1){
                 current_time = nrfx_timer_capture(&measurement_timer, NRF_TIMER_CC_CHANNEL0);
                     
@@ -554,9 +648,6 @@ static void timer_handler(nrf_timer_event_t event_type, void * p_context)
             break;
             
         case NRF_TIMER_EVENT_COMPARE1:
-#if defined(CONFIG_BT)
-            stim_ensure_hfclk();
-#endif
             if(MEASURE_TIMER == 1){
                 // Capture timestamp when event 1 occurs
                 current_time = nrfx_timer_capture(timer_inst, NRF_TIMER_CC_CHANNEL4);
@@ -574,9 +665,6 @@ static void timer_handler(nrf_timer_event_t event_type, void * p_context)
             break;
             
         case NRF_TIMER_EVENT_COMPARE2:
-#if defined(CONFIG_BT)
-            stim_ensure_hfclk();
-#endif
             if(MEASURE_TIMER == 1){
                 // Capture timestamp when event 2 occurs
                 current_time = nrfx_timer_capture(timer_inst, NRF_TIMER_CC_CHANNEL4);
@@ -589,16 +677,12 @@ static void timer_handler(nrf_timer_event_t event_type, void * p_context)
             }
             
             if (!burst_phase2_done) {
-                stim_interphase_end();
                 stim_phase2_begin();
                 burst_phase2_done = true;
             }
             break;
             
         case NRF_TIMER_EVENT_COMPARE3:
-#if defined(CONFIG_BT)
-            stim_ensure_hfclk();
-#endif
             if(MEASURE_TIMER == 1){
                 // Capture timestamp when event 3 occurs
                 current_time = nrfx_timer_capture(timer_inst, NRF_TIMER_CC_CHANNEL4);
@@ -622,7 +706,9 @@ static void timer_handler(nrf_timer_event_t event_type, void * p_context)
                 rtc_stim_stop();
             }
 #else
-            /* End of biphasic burst (low-power path): stop TIMER00 until next RTC period. */
+            /* End of biphasic burst (low-power path): stop TIMER00 until next RTC
+             * period. HFXO stays referenced until the session stops.
+             */
             nrfx_timer_disable(timer_inst);
 #endif
             break;

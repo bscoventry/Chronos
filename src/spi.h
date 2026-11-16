@@ -21,6 +21,11 @@ void spi_write_dac1(uint8_t *tx_data, uint8_t *rx_data);
 void spi_init();
 void update_dac1_amplitude(uint16_t amplitude);
 void update_dac2_amplitude(uint16_t amplitude);
+/** IRQ-safe: update DAC buffers without logging (closed-loop amplitude steps). */
+void stim_set_amplitude_code_quiet(uint16_t amplitude);
+
+/** Wait for SPIM21 idle before System OFF (nrfx build only). */
+void spi_prepare_for_power_off(void);
 
 /** Incremented on nrfx_spim_xfer error or wait timeout (stale DAC latch if non-zero). */
 extern uint32_t spi_xfer_fail_count;

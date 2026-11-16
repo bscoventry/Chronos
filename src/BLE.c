@@ -23,13 +23,17 @@
 #endif
 
 #include <zephyr/sys/util.h>
+#include <zephyr/sys/byteorder.h>
 #include <string.h>
+#include <errno.h>
 
 #include <zephyr/logging/log.h>
 #define LOG_MODULE_NAME peripheral_uart
 #include "BLE.h"
 #include "ble_session.h"
 #include "data.h"
+#include "ADC.h"
+#include "closed_loop.h"
 
 LOG_MODULE_REGISTER(LOG_MODULE_NAME);
 K_SEM_DEFINE(ble_init_ok, 0, 1);
@@ -145,6 +149,11 @@ void disconnected(struct bt_conn *conn, uint8_t reason)
 		dk_set_led_off(CON_STATUS_LED);
 #endif
 	}
+
+	closed_loop_disarm(CL_EVT_DISCONNECTED);
+	adc_set_recording_stream(false);
+	adc_session_refresh();
+	chronos_stimulation_request_stop();
 }
 
 void recycled_cb(void)
@@ -323,6 +332,56 @@ void bt_receive_cb(struct bt_conn *conn, const uint8_t *const data,
 	}
 
 	process_received_data(&settings, ble_received_data, ble_data_length);
+}
+
+int ble_send_samples(uint16_t seq, const int16_t *samples, size_t count)
+{
+	static uint8_t pkt[BLE_SAMPLE_PKT_MAX_LEN];
+	static bool mtu_warned;
+	const size_t len = sizeof(seq) + count * sizeof(int16_t);
+
+	if (samples == NULL || count == 0U || current_conn == NULL || len > sizeof(pkt)) {
+		return -EINVAL;
+	}
+
+	if (bt_nus_get_mtu(current_conn) < len) {
+		if (!mtu_warned) {
+			LOG_WRN("NUS MTU %u < sample packet %u; samples not sent",
+				(unsigned int)bt_nus_get_mtu(current_conn), (unsigned int)len);
+			mtu_warned = true;
+		}
+		return -EMSGSIZE;
+	}
+
+	sys_put_le16(seq, pkt);
+	memcpy(pkt + sizeof(seq), samples, count * sizeof(int16_t));
+
+	return bt_nus_send(current_conn, pkt, len);
+}
+
+int ble_send_event(const char *msg)
+{
+	size_t len;
+
+	if (msg == NULL || current_conn == NULL) {
+		return -EINVAL;
+	}
+
+	len = strlen(msg);
+	if (len == 0U) {
+		return -EINVAL;
+	}
+
+	return bt_nus_send(NULL, (const uint8_t *)msg, len);
+}
+
+int ble_send_raw(const uint8_t *data, size_t len)
+{
+	if (data == NULL || len == 0U || current_conn == NULL) {
+		return -EINVAL;
+	}
+
+	return bt_nus_send(current_conn, data, len);
 }
 
 struct bt_nus_cb nus_cb = {
