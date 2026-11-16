@@ -1,0 +1,24 @@
+{
+    "Header": {
+        "Comment": "All values are metric (mm)",
+        "CreationDate": "2025-04-09T17:30:23Z",
+        "GenerationSoftware": {
+            "Application": "Fusion Electronics",
+            "Vendor": "Autodesk",
+            "Version": "9.7.0"
+        },
+        "Part": "Single"
+    },
+    "Overall": {
+        "BoardThickness": 1.1978,
+        "LayerNumber": 4,
+        "Name": {
+            "ProjectId": "PCB v83"
+        },
+        "Owner": "Brandon Coventry <coventry@wisc.edu>",
+        "Size": {
+            "X": 31.587794,
+            "Y": 31.587794
+        }
+    }
+}
