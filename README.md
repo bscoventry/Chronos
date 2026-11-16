@@ -2,7 +2,7 @@ Chronos: An open-source, closed loop neuromodulation platform.
 
 Welcome to the home of the Chronos project!
 
-![Chronos Image](https://github.com/bscoventry/Chronos/image.png)
+![Chronos Image](https://github.com/bscoventry/Chronos/blob/main/image.png)
 
 There is a crucial disparity between the evaluation of neuromodulation therapies in preclinical animla models and their clinical application. 
 While chronic stimulation in humans produces long-term neural adaptation, entrainment phenomena, and biomolecular remodeling, most preclinical 
